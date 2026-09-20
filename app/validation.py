@@ -293,3 +293,30 @@ def validate_batch_data_plans_request(payload: Any) -> list[dict]:
         raise PolicyValidationError(errors)
 
     return normalized
+
+
+def validate_replacement_preview_request(payload: Any) -> tuple[list[dict], list[dict]]:
+    """Validate a replacement preview request body.
+
+    The body combines a candidate policy (``rules``) with the batch-style
+    ``cases`` array.  Returns the normalized ``(candidate_rules, cases)``
+    tuple; raises :class:`PolicyValidationError` collecting the errors of
+    both parts.
+    """
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    errors: list[str] = []
+    rules: list[dict] = []
+    cases: list[dict] = []
+    try:
+        rules = validate_policy(payload)
+    except PolicyValidationError as exc:
+        errors.extend(exc.errors)
+    try:
+        cases = validate_batch_data_plans_request(payload)
+    except PolicyValidationError as exc:
+        errors.extend(exc.errors)
+    if errors:
+        raise PolicyValidationError(errors)
+    return rules, cases

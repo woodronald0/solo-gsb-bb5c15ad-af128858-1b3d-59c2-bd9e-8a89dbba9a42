@@ -11,12 +11,14 @@ from pydantic import BaseModel, Field
 from .batch import BatchPlanSearchError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
+from .preview import replacement_preview
 from .store import store
 from .validation import (
     PolicyValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
     validate_policy,
+    validate_replacement_preview_request,
 )
 
 API_PREFIX = "/api/v1"
@@ -31,7 +33,9 @@ app = FastAPI(
         "inclusion-minimal missing-field sets, inclusion-minimal "
         "counterfactual fact edits that force a target conclusion, and "
         "batch data plans: inclusion-minimal global field sets that make "
-        "every unknown case decidable."
+        "every unknown case decidable. Replacement previews adjudicate a "
+        "case set with the stored and candidate rules side by side and "
+        "report the business-impact changes without touching storage."
     ),
 )
 
@@ -213,6 +217,37 @@ async def policy_batch_data_plans(policy_id: str, request: Request) -> dict:
         "cases": summaries,
         "count": len(plans),
         "plans": plans,
+    }
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/replacement-preview",
+    tags=["adjudication"],
+)
+async def policy_replacement_preview(policy_id: str, request: Request) -> dict:
+    """Preview the impact of replacing the policy's rules on submitted cases.
+
+    Adjudicates every case with the stored policy and with the candidate
+    ``rules`` from the request body, then reports the cases whose business
+    signature changed plus the aggregated old-to-new signature transitions.
+    The stored policy is never modified.
+    """
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    candidate_rules, cases = validate_replacement_preview_request(payload)
+
+    changes, transition_counts = replacement_preview(
+        record, candidate_rules, cases
+    )
+    return {
+        "policy_id": policy_id,
+        "case_count": len(cases),
+        "change_count": len(changes),
+        "changes": changes,
+        "transition_counts": transition_counts,
     }
 
 

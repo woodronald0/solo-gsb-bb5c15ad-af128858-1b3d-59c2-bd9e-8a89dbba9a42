@@ -73,6 +73,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
+| POST | `/api/v1/policies/{id}/replacement-preview` | 替换影响预览：候选规则对案例集的业务影响（不写入存储） |
 
 ## 策略结构
 
@@ -311,16 +312,108 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/batch-data-plans \
 例如某案例需要 `age`、另一案例需要 `flag` 或 `vip` 时，方案为
 `["age","flag"]` 与 `["age","vip"]` 两个。
 
+## 替换影响预览示例（replacement-preview）
+
+提交候选 `rules` 与一批带唯一 `case_id` 的案例，服务分别用**当前存储策略**
+与**候选策略**逐案裁决，把每次裁决压缩成**业务结果签名**（`status`、
+`conclusion`、`decided_priority`，以及 `conflict` 的
+`conflicting_conclusions` / `unknown` 的 `minimal_missing_field_sets` 与
+`pending_conclusions`），据此报告替换影响。**整个过程不写存储**，当前策略
+保持不变。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `rules` | 非空数组 | 候选策略规则（结构与创建策略相同，仅用于预览） |
+| `cases` | 非空数组 | 元素为 `{"case_id": <非空字符串>, "facts": <对象>}`；`facts` 缺省视为 `{}` |
+
+语义与约束：
+
+- 仅**签名不同**的案例列入 `changes`（含 `before` / `after` 签名），按
+  `case_id` 排序。
+- `transition_counts` 把**全部**案例按“旧签名 → 新签名”汇总计数（未变化
+  的案例体现为 `from == to`），按两个签名的规范 JSON 序确定性排序。
+- 候选 `rules` 非法、`case_id` 重复、`cases` 为空等返回 `422`，`errors`
+  同时列出规则与案例两侧的问题；此时同样不写入任何数据。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/replacement-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"id": "approve", "priority": 10, "conclusion": "approve",
+       "expr": {"all": [{"field": "income", "op": "ge", "value": 60000},
+                        {"field": "debt_ratio", "op": "lt", "value": 0.4}]}},
+      {"id": "reject", "priority": 10, "conclusion": "reject",
+       "expr": {"field": "debt_ratio", "op": "ge", "value": 0.5}}
+    ],
+    "cases": [
+      {"case_id": "applicant-1",
+       "facts": {"income": 80000, "debt_ratio": 0.2}},
+      {"case_id": "applicant-2",
+       "facts": {"income": 55000, "debt_ratio": 0.3}},
+      {"case_id": "applicant-3",
+       "facts": {"income": 55000, "debt_ratio": 0.55}}
+    ]
+  }'
+```
+
+响应（节选；以上面“裁决示例”中创建的策略为当前策略）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "case_count": 3,
+  "change_count": 2,
+  "changes": [
+    { "case_id": "applicant-2",
+      "before": { "status": "decided", "conclusion": "approve",
+                  "decided_priority": 10 },
+      "after":  { "status": "no_match", "conclusion": null,
+                  "decided_priority": null } },
+    { "case_id": "applicant-3",
+      "before": { "status": "no_match", "conclusion": null,
+                  "decided_priority": null },
+      "after":  { "status": "decided", "conclusion": "reject",
+                  "decided_priority": 10 } }
+  ],
+  "transition_counts": [
+    { "from": { "status": "decided", "conclusion": "approve",
+                "decided_priority": 10 },
+      "to":   { "status": "decided", "conclusion": "approve",
+                "decided_priority": 10 },
+      "count": 1 },
+    { "from": { "status": "decided", "conclusion": "approve",
+                "decided_priority": 10 },
+      "to":   { "status": "no_match", "conclusion": null,
+                "decided_priority": null },
+      "count": 1 },
+    { "from": { "status": "no_match", "conclusion": null,
+                "decided_priority": null },
+      "to":   { "status": "decided", "conclusion": "reject",
+                "decided_priority": 10 },
+      "count": 1 }
+  ]
+}
+```
+
+即：把收入门槛从 50000 提到 60000、拒绝阈值从 0.6 降到 0.5 后，
+`applicant-2` 从 approve 变为无匹配，`applicant-3` 从无匹配变为 reject，
+`applicant-1` 不受影响；`transition_counts` 完整覆盖全部 3 个案例的迁移
+分布。确认影响后如需真正替换策略，再调用 `PUT /api/v1/policies/{id}`。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实/批量请求校验
+  validation.py      # 策略结构校验、反事实/批量/替换预览请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
+  preview.py         # 替换影响预览：业务签名、变化列表与迁移汇总
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
@@ -336,5 +429,6 @@ python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
 python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
-python3 tests/test_batch_data_plans.py
+python3 tests/test_batch_data_plans.py && \
+python3 tests/test_replacement_preview.py
 ```
