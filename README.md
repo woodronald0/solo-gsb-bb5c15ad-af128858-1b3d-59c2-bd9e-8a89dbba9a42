@@ -73,6 +73,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
+| POST | `/api/v1/policies/{id}/replacement-preview` | 策略替换影响预览：对比当前策略与候选 rules 的裁决差异（不写入存储） |
 
 ## 策略结构
 
@@ -311,16 +312,108 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/batch-data-plans \
 例如某案例需要 `age`、另一案例需要 `flag` 或 `vip` 时，方案为
 `["age","flag"]` 与 `["age","vip"]` 两个。
 
+## 策略替换影响预览示例（replacement-preview）
+
+整体替换策略前，先提交**候选 rules**与一组带唯一 `case_id` 的案例。服务对
+每个案例分别用**当前策略**与**候选策略**各裁决一次（候选策略仅用于本次计算，
+**不会写入存储**），并把每次裁决压缩成业务结果签名：
+
+- 基础字段：`status`、`conclusion`、`decided_priority`；
+- `status == "conflict"` 时追加 `conflicting_conclusions`（排序后的冲突结论集合）；
+- `status == "unknown"` 时追加 `minimal_missing_field_sets`（包含关系最小的
+  缺失字段集合族，已确定性排序）。
+
+只有**新旧签名不同**的案例才会出现在 `changes` 中；`transition_counts` 按
+“旧签名 → 新签名”聚合案例数量。案例按 `case_id` 排序，`transition_counts`
+按旧签名再按新签名的规范 JSON 序排序，同一请求的响应完全确定。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `rules` | 非空数组 | 候选策略的规则，结构与 `POST /policies` 的 `rules` 完全一致（同样严格校验） |
+| `cases` | 非空数组 | 元素为 `{"case_id": <非空字符串>, "facts": <对象>}`；`facts` 缺省视为 `{}`；`case_id` 在请求内必须唯一 |
+
+候选 rules 结构非法、`cases` 为空、`case_id` 缺失/重复、`facts` 类型错误等
+一律返回 `422`（响应体含 `errors` 列表，rules 与 cases 的问题会一并报告），
+且**不修改、不创建任何策略**。策略不存在返回 `404`。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/replacement-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"id": "approve", "priority": 10, "conclusion": "approve",
+       "expr": {"all": [
+         {"field": "income", "op": "ge", "value": 90000},
+         {"field": "debt_ratio", "op": "lt", "value": 0.4}]}},
+      {"id": "reject", "priority": 10, "conclusion": "reject",
+       "expr": {"field": "debt_ratio", "op": "ge", "value": 0.6}}
+    ],
+    "cases": [
+      {"case_id": "applicant-1",
+       "facts": {"income": 80000, "debt_ratio": 0.2}},
+      {"case_id": "applicant-2",
+       "facts": {"income": 10000, "debt_ratio": 0.8}},
+      {"case_id": "applicant-3", "facts": {}}
+    ]
+  }'
+```
+
+响应（假设当前策略的收入门槛为 50000）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "case_count": 3,
+  "change_count": 1,
+  "changes": [
+    {
+      "case_id": "applicant-1",
+      "old_signature": {
+        "status": "decided", "conclusion": "approve",
+        "decided_priority": 10
+      },
+      "new_signature": {
+        "status": "no_match", "conclusion": null,
+        "decided_priority": null
+      }
+    }
+  ],
+  "transition_counts": [
+    {
+      "from": {"status": "decided", "conclusion": "approve",
+               "decided_priority": 10},
+      "to": {"status": "no_match", "conclusion": null,
+             "decided_priority": null},
+      "count": 1
+    }
+  ]
+}
+```
+
+说明：
+
+- `applicant-2` 两种策略下都是 `reject`，`applicant-3` 两种策略下都是
+  `unknown`（缺失字段集合相同），签名一致，故都**不**计入 `changes`，
+  也不产生 transition 计数。
+- 若替换只改变 unknown 案例的缺失字段集合（例如裁决条件从 `x` 换成 `y`），
+  新旧签名中的 `minimal_missing_field_sets` 不同，仍会计为一次 change；
+  conflict 结论集合的差异同理。
+- 候选规则省略 `id` 时与创建策略一样自动补全（`rule-1`…），不影响存储中
+  的现有策略。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实/批量请求校验
+  validation.py      # 策略结构校验、反事实/批量/替换预览请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
+  replacement.py     # 替换影响预览：业务结果签名、changes 与 transition_counts
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
@@ -336,5 +429,6 @@ python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
 python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
-python3 tests/test_batch_data_plans.py
+python3 tests/test_batch_data_plans.py && \
+python3 tests/test_replacement_preview.py
 ```

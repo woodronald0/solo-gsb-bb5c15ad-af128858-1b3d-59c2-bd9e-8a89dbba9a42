@@ -11,12 +11,14 @@ from pydantic import BaseModel, Field
 from .batch import BatchPlanSearchError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
+from .replacement import replacement_preview
 from .store import store
 from .validation import (
     PolicyValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
     validate_policy,
+    validate_replacement_preview_request,
 )
 
 API_PREFIX = "/api/v1"
@@ -29,9 +31,11 @@ app = FastAPI(
         "evaluate facts with three-valued (true/false/unknown) logic and "
         "receive priority-based verdicts with per-node derivation traces, "
         "inclusion-minimal missing-field sets, inclusion-minimal "
-        "counterfactual fact edits that force a target conclusion, and "
+        "counterfactual fact edits that force a target conclusion, "
         "batch data plans: inclusion-minimal global field sets that make "
-        "every unknown case decidable."
+        "every unknown case decidable, and replacement previews: "
+        "adjudicate cases against the current and a candidate policy and "
+        "report only the cases whose business result would change."
     ),
 )
 
@@ -214,6 +218,28 @@ async def policy_batch_data_plans(policy_id: str, request: Request) -> dict:
         "count": len(plans),
         "plans": plans,
     }
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/replacement-preview",
+    tags=["adjudication"],
+)
+async def policy_replacement_preview(policy_id: str, request: Request) -> dict:
+    """Preview how candidate rules would change verdicts before replacing.
+
+    Each case is adjudicated against the stored policy and the candidate
+    policy; only cases whose business-result signature changes are listed.
+    The candidate rules are validated but never written to the store.
+    """
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    candidate_rules, cases = validate_replacement_preview_request(payload)
+
+    result = replacement_preview(record, candidate_rules, cases)
+    return {"policy_id": policy_id, **result}
 
 
 async def _json_body(request: Request) -> Any:

@@ -238,18 +238,14 @@ def validate_counterfactual_request(payload: Any) -> tuple[dict, str, dict, int]
     return facts, target, normalized_candidates, max_changes
 
 
-def validate_batch_data_plans_request(payload: Any) -> list[dict]:
-    """Validate a batch data plans request body.
+def _validate_cases(payload: dict) -> list[dict]:
+    """Validate the ``cases`` member shared by batch/preview request bodies.
 
     Returns the normalized ``cases`` list (one ``{"case_id", "facts"}`` dict
     per case, ``facts`` defaulting to ``{}``); raises
     :class:`PolicyValidationError` with one error string per detected problem.
     """
     errors: list[str] = []
-
-    if not isinstance(payload, dict):
-        raise PolicyValidationError(["request body must be an object"])
-
     cases = payload.get("cases")
     if not isinstance(cases, list) or not cases:
         raise PolicyValidationError(["cases: must be a non-empty array"])
@@ -293,3 +289,44 @@ def validate_batch_data_plans_request(payload: Any) -> list[dict]:
         raise PolicyValidationError(errors)
 
     return normalized
+
+
+def validate_batch_data_plans_request(payload: Any) -> list[dict]:
+    """Validate a batch data plans request body.
+
+    Returns the normalized ``cases`` list (one ``{"case_id", "facts"}`` dict
+    per case, ``facts`` defaulting to ``{}``); raises
+    :class:`PolicyValidationError` with one error string per detected problem.
+    """
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+    return _validate_cases(payload)
+
+
+def validate_replacement_preview_request(payload: Any) -> tuple[list[dict], list[dict]]:
+    """Validate a policy replacement preview request body.
+
+    The candidate policy is validated with the same strict rules used for
+    policy creation.  Returns the normalized ``(candidate_rules, cases)``
+    tuple; raises :class:`PolicyValidationError` collecting every problem
+    found in either member, so nothing is ever written to the store.
+    """
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    try:
+        candidate_rules = validate_policy(payload)
+    except PolicyValidationError as exc:
+        candidate_rules = []
+        errors.extend(exc.errors)
+
+    try:
+        cases = _validate_cases(payload)
+    except PolicyValidationError as exc:
+        cases = []
+        errors.extend(exc.errors)
+
+    if errors:
+        raise PolicyValidationError(errors)
+    return candidate_rules, cases
